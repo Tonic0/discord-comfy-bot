@@ -7,6 +7,7 @@ import io
 import random
 import signal
 import sys
+import asyncio
 from PIL import Image
 
 # =========================
@@ -115,6 +116,27 @@ def wait_for_image(prompt_id: str):
 
     return None
 
+
+def fetch_and_convert_image(image_info):
+    r = requests.get(
+        f"{COMFYUI_URL}/view",
+        params={
+            "filename": image_info["filename"],
+            "subfolder": image_info.get("subfolder", ""),
+            "type": image_info.get("type", "preview")
+        }
+    )
+    r.raise_for_status()
+
+    png_bytes = io.BytesIO(r.content)
+    img = Image.open(png_bytes)
+
+    jpeg_bytes = io.BytesIO()
+    img.convert("RGB").save(jpeg_bytes, format="JPEG", quality=95)
+    jpeg_bytes.seek(0)
+
+    return jpeg_bytes
+
 # =========================
 # DISCORD EVENTS
 # =========================
@@ -140,7 +162,6 @@ async def on_message(message):
 
     # New generation
     else:
-        # Match longest prefixes first (!zl / !zp before !z)
         for prefix in sorted(WORKFLOWS.keys(), key=len, reverse=True):
             if message.content.startswith(prefix + " ") or message.content == prefix:
                 prompt = message.content[len(prefix):].strip()
@@ -156,29 +177,15 @@ async def on_message(message):
     await message.channel.send("Generating image...")
 
     try:
-        prompt_id = queue_prompt(prompt, workflow_file)
-        image_info = wait_for_image(prompt_id)
+        # Run all blocking work off the event loop
+        prompt_id = await asyncio.to_thread(queue_prompt, prompt, workflow_file)
+        image_info = await asyncio.to_thread(wait_for_image, prompt_id)
 
         if not image_info:
             await message.channel.send("Image generation timed out.")
             return
 
-        r = requests.get(
-            f"{COMFYUI_URL}/view",
-            params={
-                "filename": image_info["filename"],
-                "subfolder": image_info.get("subfolder", ""),
-                "type": image_info.get("type", "preview")
-            }
-        )
-        r.raise_for_status()
-
-        png_bytes = io.BytesIO(r.content)
-        img = Image.open(png_bytes)
-
-        jpeg_bytes = io.BytesIO()
-        img.convert("RGB").save(jpeg_bytes, format="JPEG", quality=95)
-        jpeg_bytes.seek(0)
+        jpeg_bytes = await asyncio.to_thread(fetch_and_convert_image, image_info)
 
         await message.channel.send(
             file=discord.File(fp=jpeg_bytes, filename="generated.jpg")
