@@ -1,14 +1,14 @@
 import discord
-import requests
+import aiohttp
+import asyncio
 import uuid
 import json
-import time
 import io
 import random
 import signal
 import sys
-import asyncio
 from PIL import Image
+from collections import deque
 
 # =========================
 # CONFIG
@@ -35,8 +35,16 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# Stores (prompt, workflow_file)
-client.last_request = None
+# =========================
+# STATE
+# =========================
+
+job_queue = deque()
+queue_lock = asyncio.Lock()
+queue_event = asyncio.Event()
+
+# Per-user memory: user_id -> (prompt, workflow_file)
+last_request_per_user = {}
 
 # =========================
 # SIGNAL HANDLING
@@ -68,7 +76,7 @@ def set_positive_prompt_only(workflow: dict, prompt_text: str):
             node["inputs"]["text"] = prompt_text
 
 
-def queue_prompt(prompt_text: str, workflow_file: str) -> str:
+async def queue_prompt(session, prompt_text, workflow_file):
     with open(workflow_file, "r", encoding="utf-8") as f:
         workflow = json.load(f)
 
@@ -83,15 +91,16 @@ def queue_prompt(prompt_text: str, workflow_file: str) -> str:
         "client_id": str(uuid.uuid4())
     }
 
-    r = requests.post(f"{COMFYUI_URL}/prompt", json=payload)
-    r.raise_for_status()
-    return r.json()["prompt_id"]
+    async with session.post(f"{COMFYUI_URL}/prompt", json=payload) as r:
+        r.raise_for_status()
+        data = await r.json()
+        return data["prompt_id"]
 
 
-def get_preview_image(prompt_id: str):
-    r = requests.get(f"{COMFYUI_URL}/history")
-    r.raise_for_status()
-    history = r.json()
+async def get_preview_image(session, prompt_id):
+    async with session.get(f"{COMFYUI_URL}/history") as r:
+        r.raise_for_status()
+        history = await r.json()
 
     if prompt_id not in history:
         return None
@@ -104,31 +113,32 @@ def get_preview_image(prompt_id: str):
     return None
 
 
-def wait_for_image(prompt_id: str):
+async def wait_for_image(session, prompt_id):
     waited = 0
     while waited < MAX_WAIT_SECONDS:
-        time.sleep(POLL_INTERVAL)
+        await asyncio.sleep(POLL_INTERVAL)
         waited += POLL_INTERVAL
 
-        image_info = get_preview_image(prompt_id)
+        image_info = await get_preview_image(session, prompt_id)
         if image_info:
             return image_info
 
     return None
 
 
-def fetch_and_convert_image(image_info):
-    r = requests.get(
+async def fetch_and_convert_image(session, image_info):
+    async with session.get(
         f"{COMFYUI_URL}/view",
         params={
             "filename": image_info["filename"],
             "subfolder": image_info.get("subfolder", ""),
             "type": image_info.get("type", "preview")
         }
-    )
-    r.raise_for_status()
+    ) as r:
+        r.raise_for_status()
+        content = await r.read()
 
-    png_bytes = io.BytesIO(r.content)
+    png_bytes = io.BytesIO(content)
     img = Image.open(png_bytes)
 
     jpeg_bytes = io.BytesIO()
@@ -138,29 +148,64 @@ def fetch_and_convert_image(image_info):
     return jpeg_bytes
 
 # =========================
+# QUEUE WORKER
+# =========================
+
+async def job_worker():
+    async with aiohttp.ClientSession() as session:
+        while True:
+            await queue_event.wait()
+
+            async with queue_lock:
+                if not job_queue:
+                    queue_event.clear()
+                    continue
+                message, user_id, prompt, workflow_file = job_queue.popleft()
+
+            try:
+                prompt_id = await queue_prompt(session, prompt, workflow_file)
+                image_info = await wait_for_image(session, prompt_id)
+
+                if not image_info:
+                    await message.channel.send("Image generation timed out.")
+                    continue
+
+                jpeg_bytes = await fetch_and_convert_image(session, image_info)
+
+                await message.channel.send(
+                    file=discord.File(fp=jpeg_bytes, filename="generated.jpg")
+                )
+
+            except Exception as e:
+                print("ERROR:", e)
+                await message.channel.send("An error occurred during generation.")
+
+# =========================
 # DISCORD EVENTS
 # =========================
 
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
+    client.loop.create_task(job_worker())
+
 
 @client.event
 async def on_message(message):
     if message.author.bot:
         return
 
+    user_id = message.author.id
     prompt = None
     workflow_file = None
 
-    # Reroll
+    # Reroll (per-user)
     if message.content.startswith(REROLL_PREFIX):
-        if not client.last_request:
-            await message.channel.send("No previous prompt to reroll.")
+        if user_id not in last_request_per_user:
+            await message.channel.send("You have no previous prompt to reroll.")
             return
-        prompt, workflow_file = client.last_request
+        prompt, workflow_file = last_request_per_user[user_id]
 
-    # New generation
     else:
         for prefix in sorted(WORKFLOWS.keys(), key=len, reverse=True):
             if message.content.startswith(prefix + " ") or message.content == prefix:
@@ -169,31 +214,19 @@ async def on_message(message):
                     await message.channel.send("Please provide a prompt.")
                     return
                 workflow_file = WORKFLOWS[prefix]
-                client.last_request = (prompt, workflow_file)
+                last_request_per_user[user_id] = (prompt, workflow_file)
                 break
         else:
             return
 
-    await message.channel.send("Generating image...")
+    async with queue_lock:
+        job_queue.append((message, user_id, prompt, workflow_file))
+        position = len(job_queue)
+        queue_event.set()
 
-    try:
-        # Run all blocking work off the event loop
-        prompt_id = await asyncio.to_thread(queue_prompt, prompt, workflow_file)
-        image_info = await asyncio.to_thread(wait_for_image, prompt_id)
-
-        if not image_info:
-            await message.channel.send("Image generation timed out.")
-            return
-
-        jpeg_bytes = await asyncio.to_thread(fetch_and_convert_image, image_info)
-
-        await message.channel.send(
-            file=discord.File(fp=jpeg_bytes, filename="generated.jpg")
-        )
-
-    except Exception as e:
-        print("ERROR:", e)
-        await message.channel.send("An error occurred during generation.")
+    await message.channel.send(
+        f"Your request has been added to the queue. Position: {position}"
+    )
 
 # =========================
 # RUN
